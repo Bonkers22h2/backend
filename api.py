@@ -30,6 +30,60 @@ class StudentData(BaseModel):
     risk_features: dict
     career_features: dict
 
+
+def translate_gwa_to_20_scale(ph_gwa):
+    """
+    Translate Philippine GWA (1.00 best, 3.00 passing, >3.00 failing)
+    to the 0-20 scale expected by the SVM model.
+    """
+    if ph_gwa > 3.00:
+        return 0.0
+
+    translated = 20.0 - ((ph_gwa - 1.00) * 5.0)
+    return max(0.0, min(20.0, translated))
+
+
+def translate_gwa_to_4_scale(ph_gwa):
+    """
+    Translate Philippine GWA (1.00 best, 3.00 passing, >3.00 failing)
+    to the 0-4 scale expected by the track model.
+    """
+    if ph_gwa > 3.00:
+        return 0.0
+
+    translated = 4.0 - ((ph_gwa - 1.00) * 1.5)
+    return max(0.0, min(4.0, translated))
+
+
+def apply_gwa_translation(risk_features, career_features):
+    """
+    Apply Philippine GWA translation to fields expected by each model.
+    """
+    translated_risk = dict(risk_features)
+    translated_career = dict(career_features)
+
+    risk_grade_keys = [
+        "Curricular units 1st sem (grade)",
+        "Curricular units 2nd sem (grade)",
+        "Previous qualification (grade)",
+        "Admission grade",
+    ]
+
+    for key in risk_grade_keys:
+        if key in translated_risk:
+            try:
+                translated_risk[key] = translate_gwa_to_20_scale(float(translated_risk[key]))
+            except (ValueError, TypeError):
+                pass
+
+    if "GPA" in translated_career:
+        try:
+            translated_career["GPA"] = translate_gwa_to_4_scale(float(translated_career["GPA"]))
+        except (ValueError, TypeError):
+            pass
+
+    return translated_risk, translated_career
+
 # 3. The 15-Rule Expert Inference Engine
 def expert_system_advising(risk_level, predicted_career, risk_raw, career_raw):
     """
@@ -108,13 +162,18 @@ def expert_system_advising(risk_level, predicted_career, risk_raw, career_raw):
 @app.post("/predict")
 def make_prediction(data: StudentData):
     try:
+        translated_risk_features, translated_career_features = apply_gwa_translation(
+            data.risk_features,
+            data.career_features,
+        )
+
         # A. Process Risk (SVM)
-        df_risk = pd.DataFrame([data.risk_features]).reindex(columns=risk_columns, fill_value=0)
+        df_risk = pd.DataFrame([translated_risk_features]).reindex(columns=risk_columns, fill_value=0)
         risk_input = risk_scaler.transform(df_risk)
         risk_pred = int(risk_model.predict(risk_input)[0])
 
         # B. Process Track (Decision Tree)
-        df_career = pd.DataFrame([data.career_features])
+        df_career = pd.DataFrame([translated_career_features])
         df_encoded = pd.get_dummies(df_career).reindex(columns=track_columns, fill_value=0)
         track_input = track_scaler.transform(df_encoded)
         track_pred_num = track_model.predict(track_input)[0]
