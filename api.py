@@ -100,6 +100,42 @@ def expert_system_advising(risk_level, predicted_career, risk_raw, career_raw):
     }
 
     recommended_track = track_mapping.get(predicted_career, 'General IT / Elective Mix')
+
+    # --- START HARD OVERRIDES ---
+    # Normalize possible original PH GWA or translated scales into model scales.
+    def _to_20_scale(value):
+        try:
+            numeric = float(value)
+        except (ValueError, TypeError):
+            return None
+
+        if 0.0 <= numeric <= 5.0:
+            return translate_gwa_to_20_scale(numeric)
+        return max(0.0, min(20.0, numeric))
+
+    def _to_4_scale(value):
+        try:
+            numeric = float(value)
+        except (ValueError, TypeError):
+            return None
+
+        if 0.0 <= numeric <= 5.0:
+            return translate_gwa_to_4_scale(numeric)
+        return max(0.0, min(4.0, numeric))
+
+    # 1. Risk Override: force high risk when either sem grade is below passing.
+    sem1_grade = _to_20_scale(risk_raw.get("Curricular units 1st sem (grade)"))
+    sem2_grade = _to_20_scale(risk_raw.get("Curricular units 2nd sem (grade)"))
+    if (sem1_grade is not None and sem1_grade < 10.0) or (sem2_grade is not None and sem2_grade < 10.0):
+        risk_level = 1
+
+    # 2. Track Override: prioritize selected domain for strong GPA profiles.
+    target_domain = career_raw.get("Interested Domain")
+    gpa_value = _to_4_scale(career_raw.get("GPA"))
+    if target_domain and gpa_value is not None and gpa_value >= 2.5:
+        recommended_track = track_mapping.get(target_domain, recommended_track)
+    # --- END HARD OVERRIDES ---
+
     advice_list = []
 
     # --- Category 4: External Factor Heuristics (High Priority) ---
@@ -183,8 +219,8 @@ def make_prediction(data: StudentData):
         final_track, final_health, final_advice = expert_system_advising(
             risk_pred,
             track_text,
-            data.risk_features,
-            data.career_features
+            translated_risk_features,
+            translated_career_features
         )
 
         return {
