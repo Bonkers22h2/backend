@@ -1,10 +1,95 @@
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 import joblib
 import pandas as pd
+import json
+import os
+import sqlite3
+from pathlib import Path
+
+from sqlalchemy.orm import Session
+
+from db import AuditLog, get_db, init_db
+from security import decrypt_aes_gcm, encrypt_aes_gcm, sign_payload, verify_signature
 
 app = FastAPI()
+
+
+# --- SQLite persistence (stores each /predict result) ---
+DB_PATH = Path(os.getenv("SQLITE_PATH", "")) if os.getenv("SQLITE_PATH") else Path(__file__).with_name("results.db")
+
+
+def _get_db_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _get_db_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                risk_features_json TEXT NOT NULL,
+                career_features_json TEXT NOT NULL,
+                translated_risk_features_json TEXT NOT NULL,
+                translated_career_features_json TEXT NOT NULL,
+                risk_pred INTEGER,
+                track_pred TEXT,
+                recommended_track TEXT NOT NULL,
+                health_status TEXT NOT NULL,
+                actionable_advice TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _insert_prediction(
+    *,
+    risk_features: dict,
+    career_features: dict,
+    translated_risk_features: dict,
+    translated_career_features: dict,
+    risk_pred: int,
+    track_pred: str,
+    recommended_track: str,
+    health_status: str,
+    actionable_advice: str,
+) -> int:
+    with _get_db_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO predictions (
+                risk_features_json,
+                career_features_json,
+                translated_risk_features_json,
+                translated_career_features_json,
+                risk_pred,
+                track_pred,
+                recommended_track,
+                health_status,
+                actionable_advice
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                json.dumps(risk_features, ensure_ascii=False),
+                json.dumps(career_features, ensure_ascii=False),
+                json.dumps(translated_risk_features, ensure_ascii=False),
+                json.dumps(translated_career_features, ensure_ascii=False),
+                int(risk_pred),
+                str(track_pred),
+                str(recommended_track),
+                str(health_status),
+                str(actionable_advice),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
 
 # Allow Next.js (port 3000) to communicate with this API
 app.add_middleware(
@@ -14,6 +99,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    _init_db()
+    init_db()
+
+
+def _extract_student_no(payload: dict) -> str | None:
+    """Best-effort student number extraction from incoming payload."""
+    candidates = [
+        "student_no",
+        "studentNo",
+        "student_number",
+        "studentNumber",
+        "Student No",
+        "Student Number",
+    ]
+
+    # Check common nesting patterns
+    for container_key in (None, "risk_features", "career_features"):
+        container = payload if container_key is None else payload.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        for key in candidates:
+            value = container.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+    return None
 
 # 1. Load All Models & Mappers
 risk_model = joblib.load('risk_assessment_svm_model.pkl')
@@ -27,6 +144,15 @@ track_encoder = joblib.load('track_label_encoder.pkl')
 
 # 2. Define the Incoming Data Structure
 class StudentData(BaseModel):
+    student_number: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "studentNumber",
+            "student_number",
+            "studentNo",
+            "student_no",
+        ),
+    )
     risk_features: dict
     career_features: dict
 
@@ -196,8 +322,14 @@ def expert_system_advising(risk_level, predicted_career, risk_raw, career_raw):
 
 # 4. The API Endpoint
 @app.post("/predict")
-def make_prediction(data: StudentData):
+def make_prediction(data: StudentData, db: Session = Depends(get_db)):
     try:
+        raw_payload = data.model_dump()
+        student_no = _extract_student_no(raw_payload)
+
+        encrypted_student_no = encrypt_aes_gcm(student_no) if student_no else None
+        encrypted_input = encrypt_aes_gcm(json.dumps(raw_payload, ensure_ascii=False))
+
         translated_risk_features, translated_career_features = apply_gwa_translation(
             data.risk_features,
             data.career_features,
@@ -223,13 +355,88 @@ def make_prediction(data: StudentData):
             translated_career_features
         )
 
+        audit_error = None
+        try:
+            signature = sign_payload({"recommendation": final_track})
+            db.add(
+                AuditLog(
+                    encrypted_student_no=encrypted_student_no,
+                    encrypted_input=encrypted_input,
+                    recommendation=final_track,
+                    signature=signature,
+                )
+            )
+            db.commit()
+        except Exception as db_exc:
+            db.rollback()
+            audit_error = str(db_exc)
+
+        try:
+            _insert_prediction(
+                risk_features=data.risk_features,
+                career_features=data.career_features,
+                translated_risk_features=translated_risk_features,
+                translated_career_features=translated_career_features,
+                risk_pred=risk_pred,
+                track_pred=track_text,
+                recommended_track=final_track,
+                health_status=final_health,
+                actionable_advice=final_advice,
+            )
+        except Exception:
+            pass
+
+        if audit_error is not None:
+            pass
+
         return {
             "recommended_track": final_track,
             "health_status": final_health,
-            "actionable_advice": final_advice
+            "actionable_advice": final_advice,
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+class VerifyRequest(BaseModel):
+    recommendation: str
+    signature: str
+
+
+@app.post("/verify")
+def verify_recommendation(payload: VerifyRequest):
+    return {"valid": bool(verify_signature({"recommendation": payload.recommendation}, payload.signature))}
+
+
+@app.get("/api/search")
+def search_audit_log(student_no: str, db: Session = Depends(get_db)):
+    wanted = str(student_no).strip()
+    if not wanted:
+        raise HTTPException(status_code=400, detail="student_no is required")
+
+    rows = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).all()
+    for row in rows:
+        try:
+            decrypted_student = decrypt_aes_gcm(row.encrypted_student_no) if row.encrypted_student_no else None
+        except Exception:
+            continue
+
+        if decrypted_student != wanted:
+            continue
+
+        try:
+            decrypted_input_text = decrypt_aes_gcm(row.encrypted_input)
+            decrypted_input_json = json.loads(decrypted_input_text)
+        except Exception:
+            decrypted_input_json = None
+
+        return {
+            "input": decrypted_input_json,
+            "recommendation": row.recommendation,
+            "timestamp": row.timestamp.isoformat() if row.timestamp else None,
+        }
+
+    raise HTTPException(status_code=404, detail="Not found")
 
 if __name__ == "__main__":
     import uvicorn
