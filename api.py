@@ -363,6 +363,8 @@ def make_prediction(data: StudentData, db: Session = Depends(get_db)):
                     encrypted_student_no=encrypted_student_no,
                     encrypted_input=encrypted_input,
                     recommendation=final_track,
+                    health_status=final_health,
+                    actionable_advice=final_advice,
                     signature=signature,
                 )
             )
@@ -415,6 +417,7 @@ def search_audit_log(student_no: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="student_no is required")
 
     rows = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).all()
+    matches = []
     for row in rows:
         try:
             decrypted_student = decrypt_aes_gcm(row.encrypted_student_no) if row.encrypted_student_no else None
@@ -430,13 +433,20 @@ def search_audit_log(student_no: str, db: Session = Depends(get_db)):
         except Exception:
             decrypted_input_json = None
 
-        return {
-            "input": decrypted_input_json,
-            "recommendation": row.recommendation,
-            "timestamp": row.timestamp.isoformat() if row.timestamp else None,
-        }
+        matches.append(
+            {
+                "input": decrypted_input_json,
+                "recommendation": row.recommendation,
+                "health_status": row.health_status,
+                "actionable_advice": row.actionable_advice,
+                "timestamp": row.timestamp.isoformat() if row.timestamp else None,
+            }
+        )
 
-    raise HTTPException(status_code=404, detail="Not found")
+    if not matches:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    return {"results": matches}
 
 if __name__ == "__main__":
     import uvicorn

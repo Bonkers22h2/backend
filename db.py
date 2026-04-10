@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import DateTime, Integer, LargeBinary, String, Text, create_engine
+from sqlalchemy import DateTime, Integer, LargeBinary, String, Text, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -31,12 +31,24 @@ class AuditLog(Base):
     encrypted_student_no: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     encrypted_input: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     recommendation: Mapped[str] = mapped_column(Text, nullable=False)
+    health_status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    actionable_advice: Mapped[str | None] = mapped_column(Text, nullable=True)
     signature: Mapped[str] = mapped_column(String(64), nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+
+    # Lightweight schema migration for existing SQLite files
+    with engine.begin() as conn:
+        cols = conn.execute(text("PRAGMA table_info(audit_log)")).fetchall()
+        existing = {row[1] for row in cols}  # row[1] = column name
+
+        if "health_status" not in existing:
+            conn.execute(text("ALTER TABLE audit_log ADD COLUMN health_status TEXT"))
+        if "actionable_advice" not in existing:
+            conn.execute(text("ALTER TABLE audit_log ADD COLUMN actionable_advice TEXT"))
 
 
 def get_db() -> Session:
