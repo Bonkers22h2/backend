@@ -11,7 +11,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from db import AuditLog, get_db, init_db
-from security import decrypt_aes_gcm, encrypt_aes_gcm, sign_payload, verify_signature
+from security import decrypt_aes_gcm, encrypt_aes_gcm, sign_payload, verify_signature as verify
 
 app = FastAPI()
 
@@ -395,6 +395,7 @@ def make_prediction(data: StudentData, db: Session = Depends(get_db)):
             "recommended_track": final_track,
             "health_status": final_health,
             "actionable_advice": final_advice,
+            "signature": signature,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -406,8 +407,9 @@ class VerifyRequest(BaseModel):
 
 
 @app.post("/verify")
+@app.post("/api/verify")
 def verify_recommendation(payload: VerifyRequest):
-    return {"valid": bool(verify_signature({"recommendation": payload.recommendation}, payload.signature))}
+    return {"valid": bool(verify({"recommendation": payload.recommendation}, payload.signature))}
 
 
 @app.get("/api/search")
@@ -437,6 +439,8 @@ def search_audit_log(student_no: str, db: Session = Depends(get_db)):
             {
                 "input": decrypted_input_json,
                 "recommendation": row.recommendation,
+                "signature": row.signature,
+                "integrity_valid": bool(verify({"recommendation": row.recommendation}, row.signature)),
                 "health_status": row.health_status,
                 "actionable_advice": row.actionable_advice,
                 "timestamp": row.timestamp.isoformat() if row.timestamp else None,
