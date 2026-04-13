@@ -34,7 +34,7 @@ class AuditLog(Base):
     health_status: Mapped[str | None] = mapped_column(Text, nullable=True)
     actionable_advice: Mapped[str | None] = mapped_column(Text, nullable=True)
     signature: Mapped[str] = mapped_column(String(64), nullable=False)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)
 
 
 def init_db() -> None:
